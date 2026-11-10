@@ -1,5 +1,6 @@
 """Dahua configManager CLI. Secrets are never included in diagnostic output."""
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -28,6 +29,10 @@ class Camera:
         except ValueError:
             raise CameraError("DAHUA_IP must be an IPv4 address") from None
         self.url = f"http://{host}/cgi-bin/configManager.cgi"
+        self.base_url = f"http://{host}"
+        self.user, self.password = user, password
+        self.rpc_session = None
+        self.rpc_id = 0
         self.session = requests.Session()
         self.session.trust_env = False
         self.session.auth = HTTPDigestAuth(user, password)
@@ -63,11 +68,69 @@ class Camera:
         if self.request({"action": "setConfig", **values}) != "OK":
             raise CameraError("Camera did not confirm setConfig; inspect masked --show output")
 
+    def rpc_request(self, method, params, *, login=False):
+        self.rpc_id += 1
+        payload = {"method": method, "params": params, "id": self.rpc_id}
+        if self.rpc_session is not None:
+            payload["session"] = self.rpc_session
+        try:
+            response = self.session.post(self.base_url + ("/RPC2_Login" if login else "/RPC2"),
+                                         json=payload, timeout=(5, 20), allow_redirects=False)
+            if response.status_code != 200:
+                raise CameraError(f"Camera RPC HTTP status {response.status_code}")
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError()
+            return result
+        except (requests.RequestException, ValueError):
+            raise CameraError("Camera RPC connection failed or returned invalid JSON") from None
+
+    def rpc(self, method, params):
+        if self.rpc_session is None:
+            challenge = self.rpc_request("global.login", {
+                "userName": self.user, "password": "", "clientType": "Web3.0"}, login=True)
+            try:
+                realm = challenge["params"]["realm"]
+                random = challenge["params"]["random"]
+                self.rpc_session = challenge["session"]
+                if self.rpc_session is None:
+                    raise ValueError()
+                md5 = lambda value: hashlib.md5(value.encode("utf-8")).hexdigest().upper()
+                digest = md5(f"{self.user}:{random}:{md5(f'{self.user}:{realm}:{self.password}')}")
+            except (KeyError, TypeError, ValueError):
+                self.rpc_session = None
+                raise CameraError("Camera RPC MD5 login challenge missing") from None
+            authenticated = self.rpc_request("global.login", {
+                "userName": self.user, "password": digest, "clientType": "Web3.0",
+                "authorityType": "Default", "passwordType": "Default"}, login=True)
+            if authenticated.get("result") is not True:
+                self.rpc_session = None
+                raise CameraError("Camera RPC login rejected")
+        result = self.rpc_request(method, params)
+        if result.get("result") is not True:
+            raise CameraError("Camera RPC request rejected")
+        return result
+
+    def initialize_receiver(self, receiver):
+        result = self.rpc("configManager.getConfig", {"name": "Email"})
+        try:
+            table = dict(result["params"]["table"])
+        except (KeyError, TypeError, ValueError):
+            raise CameraError("Camera RPC Email configuration missing") from None
+        table["Receivers"] = [receiver]
+        self.rpc("configManager.setConfig", {"name": "Email", "table": table})
+
+    def test_mail(self):
+        self.rpc("netApp.sendTestMail", {})
+
 
 def desired_config(env, motion_level=None):
-    user, password = env.get("SMTP_USER", ""), env.get("SMTP_PASS", "")
-    if bool(user) != bool(password):
-        raise CameraError("Set both SMTP_USER and SMTP_PASS, or leave both empty")
+    user = env.get("DAHUA_SMTP_USER") or env.get("SMTP_USER") or "dahua"
+    password = env.get("DAHUA_SMTP_PASS") or env.get("SMTP_PASS")
+    if not password and not env.get("SMTP_USER"):
+        password = "dahua123"
+    if not password:
+        raise CameraError("Set SMTP_PASS or DAHUA_SMTP_PASS for the SMTP username")
     level = str(motion_level if motion_level is not None else env.get("DAHUA_MOTION_LEVEL", "3"))
     if level not in {str(n) for n in range(1, 7)}:
         raise CameraError("Motion level must be 1..6")
@@ -80,7 +143,8 @@ def desired_config(env, motion_level=None):
         "Email.Port": port,
         "Email.UserName": user,
         "Email.Password": password,
-        "Email.Anonymous": str(not bool(user)).lower(),
+        "Email.Anonymous": "false",
+        "Email.Authentication": "true",
         "Email.SendAddress": env.get("DAHUA_SENDER", "dahua-front@camera.local"),
         "Email.Receivers[0]": env.get("DAHUA_RECEIVER", "alerts@camera.local"),
         "Email.Title": env.get("DAHUA_TITLE", "Dahua Front Door"),
@@ -94,10 +158,13 @@ def desired_config(env, motion_level=None):
 
 
 def apply(camera, values, current):
-    missing = values.keys() - current.keys()
+    # Firmware omits the first receiver until one is configured.
+    missing = values.keys() - current.keys() - {"Email.Receivers[0]"}
     if missing:
         raise CameraError("Firmware fields missing: " + ", ".join(sorted(missing)) +
                           "; use Web UI instead. No changes sent.")
+    if "Email.Receivers[0]" in values and "Email.Receivers[0]" not in current:
+        camera.initialize_receiver(values["Email.Receivers[0]"])
     camera.write(values)
     actual = {**camera.read("Email"), **camera.read("MotionDetect")}
     # Some firmware masks password on read; never compare or print it.
@@ -115,6 +182,7 @@ def main(argv=None):
     group.add_argument("--show", action="store_true", help="Read Email and MotionDetect[0], mask secrets")
     group.add_argument("--configure", "--apply", action="store_true", help="Enable SMTP snapshots and motion")
     group.add_argument("--disable", action="store_true", help="Disable motion detection and its email linkage")
+    group.add_argument("--test-mail", action="store_true", help="Send an immediate camera test email via RPC2")
     parser.add_argument("--motion-level", type=int, choices=range(1, 7))
     args = parser.parse_args(argv)
     load_dotenv(args.env_file, override=False, interpolate=False)
@@ -125,6 +193,10 @@ def main(argv=None):
             raise CameraError("DAHUA_USER and DAHUA_PASSWORD (or DAHUA_PASS) are required")
         camera = Camera(os.getenv("DAHUA_IP", "192.168.1.50"), user, password)
         try:
+            if args.test_mail:
+                camera.test_mail()
+                print("Camera accepted test email request; check bridge logs and Telegram delivery.")
+                return 0
             current = {**camera.read("Email"), **camera.read("MotionDetect")}
             if args.show:
                 shown = {key: value for key, value in current.items()
@@ -136,10 +208,8 @@ def main(argv=None):
                     "MotionDetect[0].Enable": "false",
                     "MotionDetect[0].EventHandler.MailEnable": "false"}
                 if args.configure:
-                    for key in ("Email.TlsEnable", "Email.Authentication"):
-                        if key in current:
-                            values[key] = ("false" if key.endswith("TlsEnable") else
-                                           str(bool(os.getenv("SMTP_USER"))).lower())
+                    if "Email.TlsEnable" in current:
+                        values["Email.TlsEnable"] = "false"
                 apply(camera, values, current)
                 print("Configuration applied and read-back verified (password excluded).")
         finally:

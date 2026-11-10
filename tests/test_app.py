@@ -209,6 +209,27 @@ class ConfigureTests(unittest.TestCase):
             cli.apply(camera, {'Email.Enable': 'true'}, {})
         camera.write.assert_not_called()
 
+    def test_omitted_receiver_is_written_and_verified(self):
+        values = cli.desired_config({})
+        current = {k: v for k, v in values.items() if k != 'Email.Receivers[0]'}
+        for receiver in (values['Email.Receivers[0]'], 'wrong@camera.local', None):
+            with self.subTest(receiver=receiver):
+                camera = Mock()
+                actual = dict(current)
+                if receiver is not None:
+                    actual['Email.Receivers[0]'] = receiver
+                camera.read.side_effect = lambda name: {
+                    k: v for k, v in actual.items() if k.startswith(name)}
+                if receiver == values['Email.Receivers[0]']:
+                    cli.apply(camera, values, current)
+                else:
+                    with self.assertRaisesRegex(cli.CameraError, r'Read-back mismatch: Email\.Receivers\[0\]'):
+                        cli.apply(camera, values, current)
+                camera.initialize_receiver.assert_called_once_with(values['Email.Receivers[0]'])
+                camera.write.assert_called_once_with(values)
+                self.assertEqual(camera.read.call_args_list,
+                                 [unittest.mock.call('Email'), unittest.mock.call('MotionDetect')])
+
     def test_readback_mismatch_and_password_mask(self):
         camera = Mock()
         camera.read.return_value = {'Email.Enable': 'false'}
@@ -216,6 +237,84 @@ class ConfigureTests(unittest.TestCase):
             cli.apply(camera, {'Email.Enable': 'true'}, {'Email.Enable': 'false'})
         self.assertEqual(cli.masked({'Email.Password': 'secret', 'Email.Title': 'Gate'}),
                          {'Email.Password': '********', 'Email.Title': 'Gate'})
+
+    def test_smtp_defaults_and_overrides(self):
+        for env, expected in (({}, ('dahua', 'dahua123')),
+                              ({'SMTP_USER': '', 'SMTP_PASS': ''}, ('dahua', 'dahua123')),
+                              ({'SMTP_USER': 'bridge', 'SMTP_PASS': 'secret'}, ('bridge', 'secret')),
+                              ({'DAHUA_SMTP_USER': 'camera', 'DAHUA_SMTP_PASS': 'other'}, ('camera', 'other'))):
+            with self.subTest(env=env):
+                values = cli.desired_config(env)
+                self.assertEqual((values['Email.UserName'], values['Email.Password']), expected)
+                self.assertEqual(values['Email.Anonymous'], 'false')
+                self.assertEqual(values['Email.Authentication'], 'true')
+
+    def test_rpc_md5_login_and_test_mail(self):
+        import hashlib
+        camera = cli.Camera('192.168.1.50', 'admin', 'secret')
+        self.addCleanup(camera.session.close)
+        responses = [
+            {'session': 42, 'params': {'realm': 'Login', 'random': 'nonce'}},
+            {'result': True}, {'result': True}]
+        camera.session.post = Mock(side_effect=[SimpleNamespace(status_code=200, json=lambda r=r: r)
+                                               for r in responses])
+        camera.test_mail()
+        calls = camera.session.post.call_args_list
+        md5 = lambda s: hashlib.md5(s.encode()).hexdigest().upper()
+        self.assertEqual(calls[1].kwargs['json']['params']['password'],
+                         md5('admin:nonce:' + md5('admin:Login:secret')))
+        self.assertTrue(calls[0].args[0].endswith('/RPC2_Login'))
+        self.assertTrue(calls[1].args[0].endswith('/RPC2_Login'))
+        self.assertTrue(calls[2].args[0].endswith('/RPC2'))
+        self.assertEqual(calls[2].kwargs['json']['method'], 'netApp.sendTestMail')
+        self.assertEqual(calls[2].kwargs['json']['session'], 42)
+
+    def test_receiver_rpc_preserves_email_table(self):
+        camera = cli.Camera('192.168.1.50', 'admin', 'secret')
+        self.addCleanup(camera.session.close)
+        camera.rpc = Mock(return_value={'params': {'table': {'Enable': True, 'Receivers': []}}})
+        camera.initialize_receiver('alerts@camera.local')
+        camera.rpc.assert_called_with('configManager.setConfig', {
+            'name': 'Email', 'table': {'Enable': True, 'Receivers': ['alerts@camera.local']}})
+
+    def test_rpc_failures_are_sanitized(self):
+        camera = cli.Camera('192.168.1.50', 'admin', 'secret')
+        self.addCleanup(camera.session.close)
+        camera.session.post = Mock(side_effect=requests.ConnectionError('secret'))
+        with self.assertRaises(cli.CameraError) as caught:
+            camera.test_mail()
+        self.assertNotIn('secret', str(caught.exception))
+        camera.rpc_request = Mock(return_value={'result': False})
+        with self.assertRaisesRegex(cli.CameraError, 'challenge missing'):
+            camera.test_mail()
+        camera.rpc_request.side_effect = [
+            {'session': 42, 'params': {'realm': 'Login', 'random': 'nonce'}},
+            {'result': False}]
+        with self.assertRaisesRegex(cli.CameraError, 'login rejected'):
+            camera.test_mail()
+        self.assertIsNone(camera.rpc_session)
+        camera.rpc_session = 42
+        camera.rpc_request.side_effect = None
+        with self.assertRaisesRegex(cli.CameraError, 'request rejected'):
+            camera.test_mail()
+
+    def test_receiver_initialization_failure_prevents_cgi_write(self):
+        values = cli.desired_config({})
+        camera = Mock()
+        camera.initialize_receiver.side_effect = cli.CameraError('RPC rejected')
+        current = {k: v for k, v in values.items() if k != 'Email.Receivers[0]'}
+        with self.assertRaises(cli.CameraError):
+            cli.apply(camera, values, current)
+        camera.write.assert_not_called()
+
+    def test_test_mail_cli(self):
+        with patch.dict(os.environ, {'DAHUA_PASSWORD': 'fake'}, clear=True), \
+                patch.object(cli, 'load_dotenv'), patch.object(cli, 'Camera') as factory, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['--test-mail']), 0)
+            factory.return_value.test_mail.assert_called_once_with()
+            factory.return_value.read.assert_not_called()
+            factory.return_value.session.close.assert_called_once_with()
 
     def test_invalid_settings(self):
         for env in ({'SMTP_USER': 'user'}, {'DAHUA_SMTP_PORT': '0'}, {'DAHUA_MOTION_LEVEL': '7'}):

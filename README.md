@@ -79,8 +79,8 @@ LAN-аас `http://192.168.1.50` нээж админ эрхээр нэвтэрн
 | 2 | SMTP Server | `192.168.1.245` — topnet хаягийг биш, MikroTik-ийн LAN хаягийг оруул |
 | 3 | Port | `25` — MikroTik үүнийг topnet `2525` руу хөрвүүлнэ |
 | 4 | Encryption / SSL / TLS | `None` / унтраалттай; энэ SMTP listener TLS ашиглахгүй |
-| 5 | Anonymous | `.env` дэх SMTP_USER/SMTP_PASS хоёулаа хоосон бол асаа |
-| 6 | Username / Password | Нэвтрэлт ашиглавал Anonymous-ыг унтрааж, bridge-ийн SMTP_USER/SMTP_PASS-тай яг тааруул |
+| 5 | Anonymous | Унтраа (`Anonymous=false`); firmware 2.800 anonymous SMTP илгээхгүй |
+| 6 | Username / Password | `Authentication=true`; хоосон бус username/password хэрэглэ (`dahua` / `dahua123`); bridge authentication идэвхтэй бол SMTP_USER/SMTP_PASS-тай тааруул |
 | 7 | Sender | `dahua-front@camera.local`; камер бүрт ялгаатай болго |
 | 8 | Receiver | `alerts@camera.local`; энэ нь bridge-ийн хүлээн авах шошго, бодит mailbox шаардлагагүй |
 | 9 | Subject / Title | `[Front Door] Motion` гэх мэт камерын тогтвортой нэртэй гарчиг |
@@ -122,6 +122,10 @@ Email Test амжилттай болсон нь Motion бүс, хуваарь, S
 
 ### configure_dahua.py CLI
 
+**Critical firmware requirement — DH-IPC-HDBW1230E-S5, firmware 2.800:** the camera refuses to send SMTP mail with `Anonymous=true` or an empty username/password, even when aiosmtpd accepts any credentials. Always use `Anonymous=false`, `Authentication=true`, and non-empty credentials. The CLI uses `DAHUA_SMTP_USER` / `DAHUA_SMTP_PASS` overrides, then `SMTP_USER` / `SMTP_PASS`; when `SMTP_USER` is empty, missing credentials default to `dahua` / `dahua123`. A configured SMTP_USER requires a password. If the bridge enforces authentication, the camera credentials must match it.
+
+An initially empty `Email.Receivers` list cannot be initialized through CGI on this firmware. The CLI first reads the Email table through RPC2 and initializes the receiver with `configManager.setConfig`, preserving the other Email fields, then applies and verifies settings through CGI. RPC2 uses MD5 challenge login on `/RPC2_Login` and methods on `/RPC2`. `--test-mail` calls `netApp.sendTestMail` immediately using the camera’s saved settings; it does not configure the camera. An accepted RPC request is not proof of Telegram delivery.
+
 Камерын LAN-д хүрэх Windows/Linux машинаас ажиллуулна. Docker image нь зөвхөн `app.py`-г агуулдаг тул CLI-г host/ажлын компьютер дээр ажиллуулна.
 
 ```powershell
@@ -132,6 +136,7 @@ Copy-Item .env.example .env
 .\.venv\Scripts\python.exe configure_dahua.py --show
 .\.venv\Scripts\python.exe configure_dahua.py --configure
 .\.venv\Scripts\python.exe configure_dahua.py --apply --motion-level 3
+.\.venv\Scripts\python.exe configure_dahua.py --test-mail
 .\.venv\Scripts\python.exe configure_dahua.py --disable
 ```
 
@@ -142,10 +147,11 @@ Linux дээр `python3 -m venv .venv`, `.venv/bin/python` хэрэглэнэ. �
 | `--show` | Email болон MotionDetect[0]-ийн тохиргоог уншиж нууц үгийн утгыг `********` болгоно |
 | `--configure`, `--apply` | Ижил үйлдэл: SMTP, attachment, motion, email/snapshot linkage-ийг асаана; дэмжигдсэн TLS/auth талбарыг тохируулна |
 | `--motion-level 1..6` | DAHUA_MOTION_LEVEL-ийг тухайн дуудлагад орлоно |
+| `--test-mail` | RPC2 `netApp.sendTestMail` ашиглан камераас шууд туршилтын имэйл илгээнэ; bridge log болон Telegram-д хүрснийг шалга |
 | `--disable` | MotionDetect[0].Enable болон email linkage-ийг унтраана; SMTP үйлчилгээг бүхэлд нь унтраахгүй |
 | `--env-file PATH` | Өгөгдмөл нь скрипттэй зэрэгцэх `.env`; процессын environment утга файлаас давуу эрхтэй |
 
-Нэг дуудлагад `--show`, `--configure`/`--apply`, `--disable`-аас нэгийг сонгоно. `DAHUA_PASSWORD` хоосон үед `DAHUA_PASS` нөөц утга болно. CLI нь шаардлагатай талбарууд firmware-д байгаа эсэхийг бичихээс **өмнө** шалгана. Талбар дутвал өөрчлөлт илгээхгүй, Web UI ашиглахыг заана. Бичсэний дараа password-оос бусад утгыг дахин уншиж харьцуулна; mismatch гарвал хэсэгчилсэн өөрчлөлт үлдсэн байж болно. CLI нь snapshot quality, region, schedule-ийг тохируулахгүй: Web UI-аар заавал шалгана. Камерын HTTP API нь LAN-д зориулагдсан, интернет рүү нээхгүй.
+Нэг дуудлагад `--show`, `--configure`/`--apply`, `--test-mail`, `--disable`-аас нэгийг сонгоно. `DAHUA_PASSWORD` хоосон үед `DAHUA_PASS` нөөц утга болно. CLI нь шаардлагатай талбарууд firmware-д байгаа эсэхийг бичихээс **өмнө** шалгана. Талбар дутвал өөрчлөлт илгээхгүй, Web UI ашиглахыг заана. Бичсэний дараа password-оос бусад утгыг дахин уншиж харьцуулна; mismatch гарвал хэсэгчилсэн өөрчлөлт үлдсэн байж болно. CLI нь snapshot quality, region, schedule-ийг тохируулахгүй: Web UI-аар заавал шалгана. Камерын HTTP API нь LAN-д зориулагдсан, интернет рүү нээхгүй.
 
 ## 4. topnet Docker үйлчилгээ
 
@@ -166,7 +172,7 @@ chmod 600 .env
 | TELEGRAM_TOKEN | Сувагт нийтлэх эрхтэй bot-ын token; жишээ нууц утгыг repository-д оруулахгүй |
 | TELEGRAM_CHAT_ID | `-1003974950304` |
 | DEVICE_NAME | Identity олдохгүй үед ашиглах камерын нэр |
-| SMTP_USER / SMTP_PASS | Хоёул хоосон эсвэл хоёул бөглөсөн; камерын тохиргоотой ижил |
+| SMTP_USER / SMTP_PASS | Өгөгдмөл `dahua` / `dahua123`; bridge authentication идэвхтэй бол камерын тохиргоотой ижил |
 | COOLDOWN_S | Өгөгдмөл `15`; камер ба event тус бүрийн давталт дарах секунд; `0` бол дарахгүй |
 | SMTP_BIND / SMTP_PORT | `0.0.0.0` / `2525`; host-ын SMTP publish хаяг/порт |
 | HTTP_BIND / HTTP_PORT | Зөвхөн local шалгалтад `127.0.0.1` / `8090` болгохыг зөвлөе |
