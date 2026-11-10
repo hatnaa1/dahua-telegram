@@ -65,14 +65,22 @@ class Bridge:
         self.password = os.environ.get("SMTP_PASS", "")
         self.webhook_token = os.environ.get("WEBHOOK_TOKEN", "")
         self.cooldown = float(os.environ.get("COOLDOWN_S", "15"))
+        self.burst_window = float(os.environ.get("BURST_WINDOW_S", "2.5"))
+        self.max_burst_photos = int(os.environ.get("MAX_BURST_PHOTOS", "3"))
         if not self.token or not self.chat:
             raise ValueError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are required")
         if self.user and not self.password:
             raise ValueError("SMTP_PASS is required when SMTP_USER is set")
         if not math.isfinite(self.cooldown) or self.cooldown < 0:
             raise ValueError("COOLDOWN_S must be finite and nonnegative")
+        if not math.isfinite(self.burst_window) or self.burst_window < 0:
+            raise ValueError("BURST_WINDOW_S must be finite and nonnegative")
+        if self.max_burst_photos < 1:
+            raise ValueError("MAX_BURST_PHOTOS must be positive")
         self.lock = threading.Lock()
         self.last = {}
+        self.burst_lock = threading.Lock()
+        self.bursts = {}
 
     def authenticate(self, server, session, envelope, mechanism, auth_data):
         valid = isinstance(auth_data, LoginPassword) and (
@@ -128,6 +136,35 @@ class Bridge:
                 self.last[key] = time.monotonic()
             return True
 
+    def collect_burst(self, event, detail, images, device):
+        """Queue photos without blocking subsequent emails on the SMTP session."""
+        key = (device.casefold(), event)
+        with self.burst_lock:
+            burst = self.bursts.get(key)
+            if burst is None:
+                burst = {"images": []}
+                self.bursts[key] = burst
+                timer = threading.Timer(
+                    self.burst_window, self.flush_burst, args=(key, burst, detail, device))
+                timer.daemon = True
+                burst["timer"] = timer
+            remaining = self.max_burst_photos - len(burst["images"])
+            burst["images"].extend(images[:remaining])
+            if not burst["timer"].is_alive():
+                burst["timer"].start()
+        return True
+
+    def flush_burst(self, key, burst, detail, device):
+        with self.burst_lock:
+            if self.bursts.get(key) is not burst:
+                return
+            del self.bursts[key]
+        try:
+            sent = self.deliver(key[1], detail, burst["images"], device=device)
+            LOG.info("SMTP burst %s", "delivered" if sent else "cooldown")
+        except Exception:
+            LOG.error("SMTP burst delivery failed")
+
     def mail(self, raw):
         message = BytesParser(policy=policy.default).parsebytes(raw)
         subject = str(message.get("Subject", ""))
@@ -150,9 +187,14 @@ class Bridge:
                     bodies.append(data.decode(part.get_content_charset() or "utf-8", errors="replace"))
                 except LookupError:
                     bodies.append(data.decode("utf-8", errors="replace"))
+        is_test = bool(re.search(r"\btest\b", subject, re.I))
+        if not images and not is_test:
+            return False
         device = mail_identity(message, bodies, self.device)
+        if images and not is_test and self.burst_window > 0:
+            return self.collect_burst("motion", subject or "motion", images, device)
         return self.deliver("motion", subject or "motion", images,
-                            test=bool(re.search(r"\btest\b", subject, re.I)),
+                            test=is_test,
                             text="\n".join(bodies)[:2500] if not images else None,
                             device=device)
 
@@ -165,7 +207,7 @@ class MailHandler:
     async def handle_DATA(self, server, session, envelope):
         try:
             sent = await asyncio.to_thread(self.bridge.mail, envelope.original_content)
-            LOG.info("SMTP %s", "delivered" if sent else "cooldown")
+            LOG.info("SMTP %s", "accepted" if sent else "ignored or cooldown")
             return "250 Message processed"
         except Exception:
             LOG.error("SMTP delivery failed")

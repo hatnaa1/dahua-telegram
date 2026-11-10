@@ -23,7 +23,7 @@ class BridgeTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {
             'TELEGRAM_TOKEN': 'fake', 'TELEGRAM_CHAT_ID': '-1002907522749',
-            'COOLDOWN_S': '15'}, clear=True)
+            'COOLDOWN_S': '15', 'BURST_WINDOW_S': '0'}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
         self.bridge = app.Bridge()
@@ -32,7 +32,9 @@ class BridgeTests(unittest.TestCase):
     def test_required_configuration(self):
         for values in ({'TELEGRAM_TOKEN': ''}, {'TELEGRAM_CHAT_ID': ''},
                        {'SMTP_USER': 'camera'}, {'COOLDOWN_S': '-1'},
-                       {'COOLDOWN_S': 'nan'}, {'COOLDOWN_S': 'inf'}):
+                       {'COOLDOWN_S': 'nan'}, {'COOLDOWN_S': 'inf'},
+                       {'BURST_WINDOW_S': '-1'}, {'BURST_WINDOW_S': 'nan'},
+                       {'BURST_WINDOW_S': 'inf'}, {'MAX_BURST_PHOTOS': '0'}):
             with self.subTest(values=values), patch.dict(os.environ, values):
                 with self.assertRaises(ValueError):
                     app.Bridge()
@@ -104,9 +106,74 @@ class BridgeTests(unittest.TestCase):
 
     def test_plain_mail_unknown_charset(self):
         self.bridge.deliver = Mock()
-        self.bridge.mail(b'Subject: Motion\r\nContent-Type: text/plain; charset=unknown\r\n\r\nCamera: Gate')
+        self.bridge.mail(b'Subject: Test\r\nContent-Type: text/plain; charset=unknown\r\n\r\nCamera: Gate')
         self.assertEqual(self.bridge.deliver.call_args.kwargs['device'], 'Gate')
         self.assertIn('Camera: Gate', self.bridge.deliver.call_args.kwargs['text'])
+
+    def snapshot_mail(self, photo=None, subject='Motion Detect', device='Gate'):
+        message = EmailMessage()
+        message['Subject'] = subject
+        message.set_content(f'Camera: {device}')
+        if photo is not None:
+            message.add_attachment(photo, maintype='image', subtype='jpeg', filename='a.jpg')
+        return message.as_bytes()
+
+    def test_text_only_alarms_do_not_consume_cooldown(self):
+        for subject in ('Alarm Event: Motion Detect', 'Alarm End'):
+            self.assertFalse(self.bridge.mail(self.snapshot_mail(subject=subject)))
+        self.bridge.api.assert_not_called()
+        self.assertEqual(self.bridge.last, {})
+        self.assertTrue(self.bridge.mail(self.snapshot_mail(b'actual snapshot')))
+        self.bridge.api.assert_called_once()
+        self.assertEqual(self.bridge.api.call_args.args[0], 'sendPhoto')
+        self.assertFalse(self.bridge.mail(self.snapshot_mail(b'late snapshot')))
+
+    def test_text_only_test_email_sends_without_cooldown(self):
+        self.assertTrue(self.bridge.mail(self.snapshot_mail(subject='SMTP TEST')))
+        self.assertEqual(self.bridge.api.call_args.args[0], 'sendMessage')
+        self.assertEqual(self.bridge.last, {})
+
+    def test_burst_combines_snapshots_and_caps_album(self):
+        self.bridge.burst_window = 2.5
+        with patch('app.threading.Timer') as timer:
+            for photo in (b'one', b'two', b'three', b'excess'):
+                self.assertTrue(self.bridge.mail(self.snapshot_mail(photo)))
+            timer.assert_called_once()
+            self.bridge.api.assert_not_called()
+            self.assertEqual(self.bridge.last, {})
+            delay, callback = timer.call_args.args
+            self.assertEqual(delay, 2.5)
+            callback(*timer.call_args.kwargs['args'])
+        self.bridge.api.assert_called_once()
+        method, data, files = self.bridge.api.call_args.args
+        self.assertEqual(method, 'sendMediaGroup')
+        self.assertEqual(len(json.loads(data['media'])), 3)
+        self.assertEqual([photo[1] for photo in files.values()], [b'one', b'two', b'three'])
+        self.assertEqual(self.bridge.bursts, {})
+        self.assertIn(('gate', 'motion'), self.bridge.last)
+
+    def test_bursts_are_separate_per_device_and_tests_bypass_them(self):
+        self.bridge.burst_window = 2.5
+        with patch('app.threading.Timer') as timer:
+            self.bridge.mail(self.snapshot_mail(b'gate', device='Gate'))
+            self.bridge.mail(self.snapshot_mail(b'back', device='Back'))
+            self.assertEqual(timer.call_count, 2)
+            self.assertTrue(self.bridge.mail(self.snapshot_mail(subject='Test')))
+            self.assertEqual(self.bridge.api.call_args.args[0], 'sendMessage')
+            for call in timer.call_args_list:
+                call.args[1](*call.kwargs['args'])
+        self.assertEqual([call.args[0] for call in self.bridge.api.call_args_list],
+                         ['sendMessage', 'sendPhoto', 'sendPhoto'])
+
+    def test_burst_failure_does_not_consume_cooldown(self):
+        self.bridge.burst_window = 2.5
+        self.bridge.api.side_effect = app.DeliveryError('failed')
+        with patch('app.threading.Timer') as timer:
+            self.bridge.mail(self.snapshot_mail(b'photo'))
+            with self.assertLogs('dahua', level='ERROR'):
+                timer.call_args.args[1](*timer.call_args.kwargs['args'])
+        self.assertEqual(self.bridge.last, {})
+        self.assertEqual(self.bridge.bursts, {})
 
     def test_api_errors_are_sanitized(self):
         real_api = app.Bridge.api
