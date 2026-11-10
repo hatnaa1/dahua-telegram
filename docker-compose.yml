@@ -1,0 +1,20 @@
+services:
+  dahua-telegram:
+    build: .
+    container_name: dahua-telegram
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${SMTP_BIND:-0.0.0.0}:${SMTP_PORT:-2525}:2525"
+      - "${HTTP_BIND:-0.0.0.0}:${HTTP_PORT:-8090}:8090"
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
